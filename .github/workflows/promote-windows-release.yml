@@ -1,0 +1,99 @@
+name: Promote Windows Release
+
+on:
+  push:
+    branches:
+      - 'incoming/**'
+
+concurrency:
+  group: promote-windows-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staged payload
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Validate staged payload
+        id: release
+        shell: pwsh
+        run: |
+          $payload = Join-Path $env:GITHUB_WORKSPACE 'payload'
+          $versionPath = Join-Path $payload 'version.txt'
+          $notesPath = Join-Path $payload 'release-notes.md'
+          $executablePath = Join-Path $payload 'NeteaseMusic.exe'
+          $signaturePath = Join-Path $payload 'NeteaseMusic.exe.sig'
+          foreach ($requiredPath in @($versionPath, $notesPath, $executablePath, $signaturePath)) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Missing staged file: $requiredPath"
+            }
+          }
+
+          $version = [IO.File]::ReadAllText($versionPath).Trim()
+          if ($version -notmatch '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}\.[1-9][0-9]*$') {
+            throw 'Staged version does not follow YYYY.M.D.N.'
+          }
+          if ((Get-Item -LiteralPath $notesPath).Length -gt 262144) {
+            throw 'Release notes exceed the 256 KiB limit.'
+          }
+          if ((Get-Item -LiteralPath $executablePath).Length -le 0 -or
+              (Get-Item -LiteralPath $executablePath).Length -gt 536870912) {
+            throw 'Executable size is invalid.'
+          }
+          if ((Get-Item -LiteralPath $signaturePath).Length -ne 384) {
+            throw 'RSA-3072 signature size is invalid.'
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Publish stable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $tag = "v$env:VERSION"
+          $existing = gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists."
+          }
+
+          gh release create $tag `
+            'payload/NeteaseMusic.exe' `
+            'payload/NeteaseMusic.exe.sig' `
+            --title "Windows $env:VERSION" `
+            --notes-file 'payload/release-notes.md' `
+            --draft
+          gh release edit $tag --draft=false --latest
+
+          $release = gh release view $tag --json isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.isDraft -or $release.isPrerelease) {
+            throw 'Published release is not stable.'
+          }
+          $assetNames = @($release.assets | ForEach-Object { $_.name })
+          foreach ($required in @('NeteaseMusic.exe', 'NeteaseMusic.exe.sig')) {
+            if ($required -notin $assetNames) {
+              throw "Published release is missing $required."
+            }
+          }
+
+      - name: Delete staging branch
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^incoming/v[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}\.[1-9][0-9]*-[0-9]+-[0-9]+$') {
+            throw 'Refusing to delete an unexpected branch name.'
+          }
+          gh api `
+            --method DELETE `
+            -H 'Accept: application/vnd.github+json' `
+            "repos/$env:GITHUB_REPOSITORY/git/refs/heads/$env:GITHUB_REF_NAME"
